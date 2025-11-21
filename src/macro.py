@@ -3,7 +3,7 @@ import time
 import os
 
 # --- CONFIGURATION ---
-TOTAL_SCREENSHOTS = 5  # num of screenshots
+TOTAL_SCREENSHOTS = 319  # num of screenshots
 CLICK_DELAY = 1.0        # Wait 1s after clicking
 SCREENSHOT_DELAY = 1.0   # Wait 1s for overlay to appear before hitting Enter
 SAVE_DELAY = 0.5         # Wait 0.5s after Enter to ensure save completes
