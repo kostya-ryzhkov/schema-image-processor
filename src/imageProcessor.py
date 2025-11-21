@@ -3,136 +3,114 @@ import pytesseract
 import pandas as pd
 import os
 import glob
+import numpy as np
 
-# Point this to where your screenshots are
+# --- CONFIGURATION ---
 IMAGE_FOLDER = "./2-data"
-OUTPUT_CSV = "./1-output/layloData.csv"
-
-# Tesseract configuration (optimize for block of text)
+OUTPUT_CSV = "./1-output/layloData_v2.csv"
 custom_config = r'--oem 3 --psm 6'
 
-def preprocess_image(image_path):
-    """
-    Loads image, converts to grayscale, and inverts (Dark mode -> Light mode)
-    """
+# TUNING PARAMETERS (0.0 to 1.0)
+# Adjust these if the rows are still cutting through text
+HEADER_CUT_PCT = 0.13  # Cut top 13% of image
+FOOTER_CUT_PCT = 0.10  # Cut bottom 10% of image
 
+def preprocess_image(image_path):
     img = cv2.imread(image_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # Invert: Black background becomes white, text becomes black
+    # 1. Crop Header and Footer FIRST
+    h, w, _ = img.shape
+    y_start = int(h * HEADER_CUT_PCT)
+    y_end = int(h * (1.0 - FOOTER_CUT_PCT))
+    cropped_img = img[y_start:y_end, :]
+    
+    # 2. Convert to Grayscale
+    gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+    
+    # 3. Invert (Dark Mode -> Light Mode)
     inverted = cv2.bitwise_not(gray)
     
-    # Optional: Thresholding to make text crisp black and white
-    # _, thresh = cv2.threshold(inverted, 150, 255, cv2.THRESH_BINARY)
+    # 4. Binarize (Thresholding)
+    # This forces everything to be either PURE BLACK or PURE WHITE.
+    # Removes "gray" artifacts like faint lines or background noise.
+    _, thresh = cv2.threshold(inverted, 180, 255, cv2.THRESH_BINARY)
     
-    return inverted
+    return thresh
 
 def get_row_slices(img):
     """
-    Splits the image into 5 distinct rows based on fixed height or line detection.
-    Since macros are consistent, we can try fixed slicing first.
-    Assumption: 5 rows of equal height.
+    Splits the cropped data area into 5 even rows.
     """
-
     height, width = img.shape
+    # We assume the visible area strictly contains 5 row slots
     row_height = height // 5
     
     rows = []
     for i in range(5):
-        # y_start, y_end
         y1 = i * row_height
         y2 = (i + 1) * row_height
         
-        # Crop the row
-        row_img = img[y1:y2, 0:width]
-        rows.append(row_img)
+        # Safety check to ensure we don't go out of bounds
+        if y2 > height: y2 = height
+            
+        rows.append(img[y1:y2, :])
         
     return rows
 
-def extract_text_from_area(row_img, x_start_pct, x_end_pct):
-    """
-    Crops a specific column from a row based on percentage width 
-    and runs OCR.
-    """
-
+def extract_text(row_img, x1_pct, x2_pct):
     h, w = row_img.shape
-    x1 = int(w * x_start_pct)
-    x2 = int(w * x_end_pct)
+    x1 = int(w * x1_pct)
+    x2 = int(w * x2_pct)
+    crop = row_img[:, x1:x2]
     
-    # Crop column
-    crop = row_img[0:h, x1:x2]
+    # Add a little white border around the crop (helps OCR read edge text)
+    crop = cv2.copyMakeBorder(crop, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=255)
     
-    # Run OCR
-    text = pytesseract.image_to_string(crop, config=custom_config)
-    return text.strip()
+    return pytesseract.image_to_string(crop, config=custom_config).strip()
 
-# --- SPECIFIC COLUMN EXTRACTORS ---
-
-def parse_contact(row_img):
-    """
-    PRIMED: Currently just dumps raw text.
-    We will add the complex regex/ruleset here later.
-    """
-
-    # Approx width: 0% to 30% of the screen
-    raw_text = extract_text_from_area(row_img, 0.0, 0.30)
-    return raw_text
-
-def parse_location(row_img):
-    # Approx width: 30% to 48%
-    raw_text = extract_text_from_area(row_img, 0.30, 0.48)
-    # Cleanup: Replace newlines with space or comma
-    return raw_text.replace('\n', ', ')
-
-def parse_joined(row_img):
-    # Approx width: 48% to 65%
-    raw_text = extract_text_from_area(row_img, 0.48, 0.65)
-    return raw_text.replace('\n', ' ')
-
-def parse_channel(row_img):
-    # Approx width: 65% to 80%
-    raw_text = extract_text_from_area(row_img, 0.65, 0.80)
-    return raw_text
-
-def parse_engagements(row_img):
-    # Approx width: 80% to 100%
-    raw_text = extract_text_from_area(row_img, 0.80, 1.0)
-    # Extract only digits
-    digits = ''.join(filter(str.isdigit, raw_text))
-    return digits
-
-# --- MAIN EXECUTION ---
+# --- MAIN LOOP ---
 
 def main():
     all_data = []
     image_files = sorted(glob.glob(os.path.join(IMAGE_FOLDER, "*.png")))
     
-    print(f"Found {len(image_files)} images to process...")
+    print(f"Found {len(image_files)} images...")
 
     for idx, img_file in enumerate(image_files):
-        print(f"Processing {idx+1}/{len(image_files)}: {os.path.basename(img_file)}")
+        # print(f"Processing {idx+1}...") 
         
         processed_img = preprocess_image(img_file)
         rows = get_row_slices(processed_img)
         
         for row_img in rows:
-            # Extract data
+            # Extract Raw Data
+            # I tweaked the percentages slightly based on your screenshot
+            contact_raw = extract_text(row_img, 0.0, 0.28)
+            
+            # If contact is empty, the row is likely empty (end of list)
+            if not contact_raw or len(contact_raw) < 3:
+                continue
+
             record = {
-                "Contact_Raw": parse_contact(row_img),
-                "Location": parse_location(row_img),
-                "Joined_On": parse_joined(row_img),
-                "Acq_Channel": parse_channel(row_img),
-                "Engagements": parse_engagements(row_img)
+                "Contact_Raw": contact_raw,
+                # Location usually starts around 28%
+                "Location": extract_text(row_img, 0.28, 0.48).replace('\n', ', '),
+                # Joined starts around 48%
+                "Joined_On": extract_text(row_img, 0.48, 0.68).replace('\n', ' '),
+                # Channel starts around 68%
+                "Acq_Channel": extract_text(row_img, 0.68, 0.82),
+                # Engagements starts around 82%
+                "Engagements": extract_text(row_img, 0.82, 1.0)
             }
             
-            # Basic validation: ignore empty rows if any
-            if record["Contact_Raw"]: 
-                all_data.append(record)
+            # Only add digits to engagements to clean up artifacts
+            record["Engagements"] = ''.join(filter(str.isdigit, record["Engagements"]))
+            
+            all_data.append(record)
 
-    # Save to CSV
     df = pd.DataFrame(all_data)
     df.to_csv(OUTPUT_CSV, index=False)
-    print(f"Done! Saved {len(df)} rows to {OUTPUT_CSV}")
+    print(f"Done! Saved to {OUTPUT_CSV}")
 
 if __name__ == "__main__":
     main()
