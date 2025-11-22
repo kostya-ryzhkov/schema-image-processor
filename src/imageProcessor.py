@@ -8,7 +8,7 @@ import numpy as np
 
 # --- CONFIGURATION ---
 IMAGE_FOLDER = "./2-data"
-OUTPUT_CSV = "./1-output/layloData_v6.csv"
+OUTPUT_CSV = "./1-output/layloData_11-22.csv"
 
 # TUNING PARAMETERS
 # Header/Footer cuts
