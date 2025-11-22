@@ -5,15 +5,18 @@ import os
 import glob
 import re
 import numpy as np
+import concurrent.futures
+import time
 
 # --- CONFIGURATION ---
 IMAGE_FOLDER = "./2-data"
 OUTPUT_CSV = "./1-output/layloData_11-22.csv"
 
 # TUNING PARAMETERS
-# Header/Footer cuts
 HEADER_CUT_PCT = 0.12 
 FOOTER_CUT_PCT = 0.06 
+
+# --- HELPER FUNCTIONS ---
 
 def load_and_crop_vertical(image_path):
     img = cv2.imread(image_path)
@@ -68,56 +71,35 @@ def process_number_cell(row_img, x1_pct, x2_pct):
 # --- PARSING LOGIC ---
 
 def clean_location(text):
-    """
-    Replaces newlines with commas. 
-    "Chicago\nIllinois" -> "Chicago, Illinois"
-    """
     if not text: return ""
-    # Replace newlines with comma+space
     text = text.replace('\n', ', ')
-    # Collapse multiple spaces
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
 def parse_contact_details(raw_text):
-    """
-    Extracts Email, Handle, Phone, and Profile Name from raw text.
-    """
-    # Initialize
     email = None
     handle = None
     phone = None
     
-    # 1. Extract Email
-    # Regex: Standard email pattern
     email_match = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', raw_text)
     if email_match:
         email = email_match.group(0)
-        raw_text = raw_text.replace(email, '') # Remove from string
+        raw_text = raw_text.replace(email, '')
 
-    # 2. Extract Instagram Handle
-    # Regex: Starts with @, followed by allowed username chars
     handle_match = re.search(r'@[a-zA-Z0-9._]+', raw_text)
     if handle_match:
         handle = handle_match.group(0)
         raw_text = raw_text.replace(handle, '')
 
-    # 3. Extract Phone Number
-    # Regex: Matches (xxx) xxx-xxxx, +xx xxx..., or xxx-xxx-xxxx
-    # It looks for a sequence of digits and separators that is at least 7 chars long
     phone_match = re.search(r'(?:\+?\d{1,3}[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}', raw_text)
     if phone_match:
         phone = phone_match.group(0)
         raw_text = raw_text.replace(phone, '')
 
-    # 4. Extract Profile Name (Whatever is left)
-    # Clean up newlines, extra spaces, and edge artifacts (., |, ))
     name = raw_text.replace('\n', ' ')
-    # Remove artifacts often left by the icon on the left side
     name = re.sub(r'^[\s\)\.\-\|]+', '', name) 
-    # Remove artifacts that might remain on the right
     name = re.sub(r'[\s]+$', '', name)
-    name = re.sub(r'\s+', ' ', name).strip() # Collapse spaces
+    name = re.sub(r'\s+', ' ', name).strip()
 
     return name, email, phone, handle
 
@@ -125,17 +107,22 @@ def clean_date(raw_text):
     match = re.search(r'[A-Z][a-z]{2} \d{1,2}, \d{4}', raw_text)
     return match.group(0) if match else raw_text.replace('\n', ' ').strip()
 
-# --- MAIN ---
+# --- WORKER FUNCTION ---
 
-def main():
-    all_data = []
-    image_files = sorted(glob.glob(os.path.join(IMAGE_FOLDER, "*.png")))
+def process_single_image(img_file):
+    """
+    Encapsulates the logic for processing one single image file.
+    Returns a list of dictionaries (rows found in that image).
+    """
+    # Optimization: Prevent OpenCV from spawning its own threads within a process
+    # to avoid CPU thrashing when we are already doing multiprocessing.
+    cv2.setNumThreads(0)
     
-    print(f"Processing {len(image_files)} images...")
-
-    for img_file in image_files:
+    image_data = []
+    try:
         processed_img = load_and_crop_vertical(img_file)
-        if processed_img is None: continue
+        if processed_img is None: 
+            return []
         
         rows = get_row_slices(processed_img)
         
@@ -172,16 +159,61 @@ def main():
                 "Engagements": engage_raw
             }
             
-            all_data.append(record)
+            image_data.append(record)
+            
+    except Exception as e:
+        print(f"Error processing {img_file}: {e}")
+        
+    return image_data
+
+# --- MAIN ---
+
+def main():
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+
+    image_files = sorted(glob.glob(os.path.join(IMAGE_FOLDER, "*.png")))
+    total_files = len(image_files)
+    
+    print(f"Starting parallel processing for {total_files} images...")
+    start_time = time.time()
+
+    all_data = []
+    
+    # Determine number of worker processes (uses all available CPU cores)
+    max_workers = os.cpu_count() or 4 
+
+    # Use ProcessPoolExecutor for CPU-bound tasks (OCR + Image Processing)
+    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_file = {executor.submit(process_single_image, img): img for img in image_files}
+        
+        # Process results as they complete
+        completed_count = 0
+        for future in concurrent.futures.as_completed(future_to_file):
+            data_from_image = future.result()
+            if data_from_image:
+                all_data.extend(data_from_image)
+            
+            completed_count += 1
+            if completed_count % 5 == 0:
+                print(f"Progress: {completed_count}/{total_files} images processed...")
 
     df = pd.DataFrame(all_data)
     
-    # Reorder columns for readability
+    # Reorder columns
     cols = ["Profile_Name", "IG_Handle", "Email", "Phone", "Location", "Joined_On", "Acq_Channel", "Engagements"]
-    df = df[cols]
+    
+    # Handle case where dataframe might be empty if no data was found
+    if not df.empty:
+        df = df[cols]
     
     df.to_csv(OUTPUT_CSV, index=False)
+    
+    elapsed = time.time() - start_time
     print(f"Success! Saved {len(df)} rows to {OUTPUT_CSV}")
+    print(f"Total time: {elapsed:.2f} seconds")
 
 if __name__ == "__main__":
+    # Required for Windows multiprocessing
     main()
