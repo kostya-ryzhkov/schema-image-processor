@@ -1,6 +1,6 @@
 # directories to be ignored
-src/data
-src/output
+src/2-data
+src/1-output
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
