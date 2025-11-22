@@ -7,10 +7,11 @@ import re
 import numpy as np
 import concurrent.futures
 import time
+from datetime import datetime
 
 # --- CONFIGURATION ---
 IMAGE_FOLDER = "./2-data"
-OUTPUT_CSV = "./1-output/layloData_11-22.csv"
+OUTPUT_CSV = f"./1-output/layloData_{datetime.now().strftime('%m-%d_%H-%M')}.csv"
 
 # TUNING PARAMETERS
 HEADER_CUT_PCT = 0.12 
@@ -38,6 +39,9 @@ def get_row_slices(img, num_rows=5):
     return rows
 
 def process_text_cell(row_img, x1_pct, x2_pct):
+    """
+    Standard processing for text fields (Name, Email, etc)
+    """
     h, w, _ = row_img.shape
     crop = row_img[:, int(w * x1_pct):int(w * x2_pct)]
     
@@ -49,24 +53,46 @@ def process_text_cell(row_img, x1_pct, x2_pct):
     inverted = cv2.bitwise_not(scaled)
     _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    # 3. OCR (Keep newlines for formatting logic later)
+    # 3. OCR
     config = r'--oem 3 --psm 6'
     return pytesseract.image_to_string(thresh, config=config).strip()
 
 def process_number_cell(row_img, x1_pct, x2_pct):
+    """
+    Robust Number Processing for Colored Buttons (Yellow/Gold/Grey).
+    Uses Blue Channel Extraction to maximize contrast between Yellow (Low Blue) 
+    and White Text (High Blue).
+    """
     h, w, _ = row_img.shape
     crop = row_img[:, int(w * x1_pct):int(w * x2_pct)]
     
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    scaled = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    # 1. Extract Blue Channel (OpenCV is BGR, so index 0 is Blue)
+    # This turns Yellow buttons DARK and White text BRIGHT.
+    b_channel = crop[:, :, 0]
+    
+    # 2. Resize (3x for small numbers)
+    scaled = cv2.resize(b_channel, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+    
+    # 3. Invert
+    # We want the Text to be Black and Background to be White for Tesseract.
+    # In b_channel: Text is High (255), Button is Low (~0-50).
+    # After Inversion: Text is Low (0), Button is High (255).
     inverted = cv2.bitwise_not(scaled)
     
-    thresh = cv2.adaptiveThreshold(
-        inverted, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
-    )
+    # 4. Otsu Thresholding
+    # This automatically finds the separation point between the button color and text
+    _, thresh = cv2.threshold(inverted, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     
-    config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789'
-    return pytesseract.image_to_string(thresh, config=config).strip()
+    # 5. Add Padding
+    # OCR often fails if the number touches the edge of the crop. Add a 5px white border.
+    thresh = cv2.copyMakeBorder(thresh, 5, 5, 5, 5, cv2.BORDER_CONSTANT, value=255)
+    
+    # 6. OCR
+    # psm 7 = Treat the image as a single text line (better for "42" than psm 6)
+    config = r'--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789'
+    text = pytesseract.image_to_string(thresh, config=config).strip()
+    
+    return text
 
 # --- PARSING LOGIC ---
 
@@ -110,12 +136,7 @@ def clean_date(raw_text):
 # --- WORKER FUNCTION ---
 
 def process_single_image(img_file):
-    """
-    Encapsulates the logic for processing one single image file.
-    Returns a list of dictionaries (rows found in that image).
-    """
-    # Optimization: Prevent OpenCV from spawning its own threads within a process
-    # to avoid CPU thrashing when we are already doing multiprocessing.
+    # Prevent OpenCV from multithreading internally to avoid deadlock/thrashing
     cv2.setNumThreads(0)
     
     image_data = []
@@ -127,25 +148,25 @@ def process_single_image(img_file):
         rows = get_row_slices(processed_img)
         
         for row_img in rows:
-            # 1. Contact (0.09 - 0.29)
+            # 1. Contact
             contact_raw = process_text_cell(row_img, 0.09, 0.29)
             
             if len(contact_raw) < 2: continue
 
-            # Parse the specific contact fields
+            # Parse specific contact fields
             profile_name, email, phone, handle = parse_contact_details(contact_raw)
 
-            # 2. Location (0.29 - 0.46)
+            # 2. Location
             loc_raw = process_text_cell(row_img, 0.29, 0.46)
             location_clean = clean_location(loc_raw)
             
-            # 3. Joined (0.46 - 0.63)
+            # 3. Joined
             joined_raw = process_text_cell(row_img, 0.46, 0.63)
             
-            # 4. Channel (0.63 - 0.79)
+            # 4. Channel
             channel_raw = process_text_cell(row_img, 0.63, 0.79)
             
-            # 5. Engagements (0.79 - 0.87)
+            # 5. Engagements (Updated Logic)
             engage_raw = process_number_cell(row_img, 0.79, 0.87)
             
             record = {
@@ -169,7 +190,6 @@ def process_single_image(img_file):
 # --- MAIN ---
 
 def main():
-    # Ensure output directory exists
     os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
 
     image_files = sorted(glob.glob(os.path.join(IMAGE_FOLDER, "*.png")))
@@ -180,15 +200,12 @@ def main():
 
     all_data = []
     
-    # Determine number of worker processes (uses all available CPU cores)
+    # Use CPU count to determine workers
     max_workers = os.cpu_count() or 4 
 
-    # Use ProcessPoolExecutor for CPU-bound tasks (OCR + Image Processing)
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all tasks
         future_to_file = {executor.submit(process_single_image, img): img for img in image_files}
         
-        # Process results as they complete
         completed_count = 0
         for future in concurrent.futures.as_completed(future_to_file):
             data_from_image = future.result()
@@ -196,15 +213,13 @@ def main():
                 all_data.extend(data_from_image)
             
             completed_count += 1
-            if completed_count % 5 == 0:
+            if completed_count % 10 == 0:
                 print(f"Progress: {completed_count}/{total_files} images processed...")
 
     df = pd.DataFrame(all_data)
     
-    # Reorder columns
     cols = ["Profile_Name", "IG_Handle", "Email", "Phone", "Location", "Joined_On", "Acq_Channel", "Engagements"]
     
-    # Handle case where dataframe might be empty if no data was found
     if not df.empty:
         df = df[cols]
     
@@ -215,5 +230,4 @@ def main():
     print(f"Total time: {elapsed:.2f} seconds")
 
 if __name__ == "__main__":
-    # Required for Windows multiprocessing
     main()
